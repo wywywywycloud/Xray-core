@@ -82,8 +82,8 @@ func (o *Observer) Start() error {
 }
 
 func (o *Observer) Close() error {
+	o.hp.StopScheduler()
 	if o.finished != nil {
-		o.hp.StopScheduler()
 		return o.finished.Close()
 	}
 	return nil
