@@ -39,7 +39,10 @@ type Observer struct {
 }
 
 func (o *Observer) GetObservation(ctx context.Context) (proto.Message, error) {
-	return &ObservationResult{Status: o.status}, nil
+	o.statusLock.Lock()
+	defer o.statusLock.Unlock()
+	// Callers marshal and retain results after this lock is released.
+	return proto.Clone(&ObservationResult{Status: o.status}), nil
 }
 
 func (o *Observer) Type() interface{} {
