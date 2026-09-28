@@ -2,6 +2,7 @@ package localdns
 
 import (
 	"context"
+	"sync"
 	"syscall"
 	"time"
 
@@ -13,8 +14,12 @@ import (
 
 // Client is an implementation of dns.Client, which queries localhost for DNS.
 type Client struct {
-	d *net.Dialer
-	r *net.Resolver
+	mu      sync.Mutex
+	flights map[string]*localLookup
+	ctx     context.Context
+	cancel  context.CancelFunc
+	d       *net.Dialer
+	r       *net.Resolver
 }
 
 // Type implements common.HasType.
@@ -26,17 +31,23 @@ func (*Client) Type() interface{} {
 func (*Client) Start() error { return nil }
 
 // Close implements common.Closable.
-func (*Client) Close() error { return nil }
+func (c *Client) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return nil
+}
 
 // LookupIP implements Client.
 func (c *Client) LookupIP(host string, option dns.IPOption) ([]net.IP, uint32, error) {
-	var ips []net.IP
-	var err error
-	if len(internet.Controllers) > 0 {
-		ips, err = c.r.LookupIP(context.Background(), "ip", host)
-	} else {
-		ips, err = net.LookupIP(host)
+	return c.LookupIPContext(context.Background(), host, option)
+}
+
+func (c *Client) LookupIPContext(ctx context.Context, host string, option dns.IPOption) ([]net.IP, uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
+	ips, err := c.lookup(ctx, host)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -101,7 +112,9 @@ func New() *Client {
 		},
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
+		ctx: ctx, cancel: cancel,
 		d: d,
 		r: r,
 	}

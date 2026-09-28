@@ -28,6 +28,7 @@ type DNS struct {
 	hosts                  *StaticHosts
 	clients                []*Client
 	ctx                    context.Context
+	cancel                 context.CancelFunc
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
@@ -169,7 +170,9 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		clients = append(clients, NewLocalDNSClient(ipOption))
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
 	return &DNS{
+		cancel:                 cancel,
 		hosts:                  hosts,
 		ipOption:               &ipOption,
 		clients:                clients,
@@ -195,6 +198,25 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	for _, c := range s.clients {
+		switch server := c.server.(type) {
+		case *LocalNameServer:
+			server.client.Close()
+		case *ClassicNameServer:
+			server.udpServer.RemoveRay()
+		case *DoHNameServer:
+			if server.pool != nil {
+				server.pool.close()
+			} else {
+				server.httpClient.CloseIdleConnections()
+			}
+		case *QUICNameServer:
+			server.close()
+		}
+	}
 	return nil
 }
 
@@ -214,6 +236,21 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	return s.LookupIPContext(s.ctx, domain, option)
+}
+
+func (s *DNS) LookupIPContext(caller context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	ctx, cancel := context.WithCancel(serviceValues{Context: caller, service: s.ctx})
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	defer cancel()
+	if caller.Err() != nil {
+		return nil, 0, caller.Err()
+	}
+	if s.ctx.Err() != nil {
+		return nil, 0, s.ctx.Err()
+	}
+	ctx = context.WithValue(ctx, queryScopeKey{}, queryScope{service: s.ctx})
 	// Normalize the FQDN form query
 	domain = strings.TrimSuffix(domain, ".")
 	if domain == "" {
@@ -258,9 +295,9 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 
 	// Name servers lookup
 	if s.enableParallelQuery {
-		return s.parallelQuery(domain, option)
+		return s.parallelQuery(ctx, domain, option)
 	} else {
-		return s.serialQuery(domain, option)
+		return s.serialQuery(ctx, domain, option)
 	}
 }
 
@@ -360,7 +397,7 @@ func mergeQueryErrors(domain string, errs []error) error {
 	return errors.New("returning nil for domain ", domain).Base(noRNF)
 }
 
-func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	for _, client := range s.sortClients(domain) {
 		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
@@ -368,7 +405,13 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 			continue
 		}
 
-		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
+		ips, ttl, err := client.QueryIP(ctx, domain, option)
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
 
 		if len(ips) > 0 {
 			return ips, ttl, nil
@@ -383,11 +426,11 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 	return nil, 0, mergeQueryErrors(domain, errs)
 }
 
-func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
 
-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
+	resultsChan := asyncQueryAll(domain, option, clients, ctx)
 
 	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
 	results := make([]*queryResult, len(clients))
@@ -398,7 +441,12 @@ func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint3
 
 	nextGroup := 0
 	for range clients {
-		result := <-resultsChan
+		var result queryResult
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case result = <-resultsChan:
+		}
 		results[result.index] = &result
 
 		gi := groupOf[result.index]
@@ -460,9 +508,13 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 		}
 
 		go func(i int, c *Client) {
+			if ctx.Err() != nil {
+				ch <- queryResult{err: ctx.Err(), index: i}
+				return
+			}
 			qctx := ctx
 			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
+				nctx, cancel := backgroundQueryContext(ctx, c.timeoutMs*2)
 				qctx = nctx
 				defer cancel()
 			}

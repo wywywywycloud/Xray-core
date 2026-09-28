@@ -8,8 +8,8 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/features/dns"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type CachedNameserver interface {
@@ -20,6 +20,9 @@ type CachedNameserver interface {
 
 // queryIP is called from dns.Server->queryIPTimeout
 func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
 	fqdn := Fqdn(domain)
 
 	cache := s.getCacheController()
@@ -48,7 +51,7 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 }
 
 func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+	nctx, cancel := backgroundQueryContext(ctx, 8*time.Second)
 	defer cancel()
 
 	fetch(nctx, s, fqdn, option)
@@ -65,10 +68,9 @@ func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOp
 		key = key + "6"
 	}
 
-	v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
-		return doFetch(ctx, s, fqdn, option), nil
+	ret := s.getCacheController().fetchShared(ctx, key, func(ctx context.Context) result {
+		return doFetch(ctx, s, fqdn, option)
 	})
-	ret := v.(result)
 
 	return ret.ips, ret.ttl, ret.error
 }
@@ -80,30 +82,55 @@ type result struct {
 }
 
 func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) result {
-	sub4, sub6 := s.getCacheController().registerSubscribers(fqdn, option)
-	defer closeSubscribers(sub4, sub6)
-
-	noResponseErrCh := make(chan error, 2)
-	onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
-		if sub == nil {
-			return nil, nil
+	flight := ctx.Value(flightKey{}).(*queryFlight)
+	defer func() {
+		flight.cancel()
+		if udp, ok := s.(*ClassicNameServer); ok {
+			udp.cancelRequests(ctx)
 		}
+		flight.workers.Wait()
+		// Synchronize a response already admitted before cancellation/completion.
+		flight.deliveryMu.Lock()
+		flight.deliveryMu.Unlock()
+	}()
+	noResponseErrCh := make(chan error, 2)
+	start := time.Now()
+	if ctx.Err() != nil {
+		return result{error: ctx.Err()}
+	}
+	s.sendQuery(ctx, noResponseErrCh, fqdn, option)
+	var rec4, rec6 *IPRecord
+	var err4, err6 error
+	remaining := 0
+	if option.IPv4Enable {
+		remaining++
+	}
+	if option.IPv6Enable {
+		remaining++
+	}
+	for remaining > 0 {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return result{error: ctx.Err()}
 		case err := <-noResponseErrCh:
-			return nil, err
-		case msg := <-sub.Wait():
-			sub.Close()
-			return msg.(*IPRecord), nil // should panic
+			if err4 == nil {
+				err4 = err
+			} else {
+				err6 = err
+			}
+			remaining--
+		case answer := <-flight.answers:
+			if answer.family == dnsmessage.TypeA {
+				rec4 = answer.record
+			} else {
+				rec6 = answer.record
+			}
+			remaining--
 		}
 	}
-
-	start := time.Now()
-	s.sendQuery(ctx, noResponseErrCh, fqdn, option)
-
-	rec4, err4 := onEvent(sub4)
-	rec6, err6 := onEvent(sub6)
+	if ctx.Err() != nil {
+		return result{error: ctx.Err()}
+	}
 
 	var errs []error
 	if err4 != nil {

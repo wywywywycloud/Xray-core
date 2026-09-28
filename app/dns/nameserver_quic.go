@@ -29,10 +29,12 @@ const handshakeTimeout = time.Second * 8
 // QUICNameServer implemented DNS over QUIC
 type QUICNameServer struct {
 	sync.RWMutex
-	cacheController *CacheController
-	destination     *net.Destination
-	connection      *quic.Conn
-	clientIP        net.IP
+	cacheController   *CacheController
+	destination       *net.Destination
+	connection        *quic.Conn
+	closed            bool
+	connectionFlights CacheController
+	clientIP          net.IP
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -100,7 +102,20 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
+		req.flight, _ = ctx.Value(flightKey{}).(*queryFlight)
+		if ctx.Err() != nil {
+			return
+		}
+		if req.flight != nil {
+			req.flight.workers.Add(1)
+		}
 		go func(r *dnsRequest) {
+			if r.flight != nil {
+				defer r.flight.workers.Done()
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := ctx
@@ -156,6 +171,11 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				return
 			}
 
+			stopStream := context.AfterFunc(dnsCtx, func() { conn.CancelRead(0); conn.CancelWrite(0) })
+			defer stopStream()
+			defer conn.CancelRead(0)
+			defer conn.CancelWrite(0)
+			defer dnsReqBuf.Release()
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to send query")
@@ -223,47 +243,97 @@ func isActive(s *quic.Conn) bool {
 	}
 }
 
-func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
-	var conn *quic.Conn
+func (s *QUICNameServer) getConnection(ctx context.Context) (*quic.Conn, error) {
 	s.RLock()
-	conn = s.connection
-	if conn != nil && isActive(conn) {
+	if s.closed {
 		s.RUnlock()
+		return nil, context.Canceled
+	}
+	conn := s.connection
+	s.RUnlock()
+	if conn != nil && isActive(conn) {
 		return conn, nil
 	}
-	if conn != nil {
-		// we're recreating the connection, let's create a new one
-		_ = conn.CloseWithError(0, "")
-	}
-	s.RUnlock()
-
-	s.Lock()
-	defer s.Unlock()
-
-	var err error
-	conn, err = s.openConnection()
-	if err != nil {
-		// This does not look too nice, but QUIC (or maybe quic-go)
-		// doesn't seem stable enough.
-		// Maybe retransmissions aren't fully implemented in quic-go?
-		// Anyways, the simple solution is to make a second try when
-		// it fails to open the QUIC connection.
-		conn, err = s.openConnection()
-		if err != nil {
-			return nil, err
+	scope := scopeFromContext(ctx)
+	scope.timeout = handshakeTimeout
+	ctx = context.WithValue(ctx, queryScopeKey{}, scope)
+	ret := s.connectionFlights.fetchShared(ctx, "connection", func(ctx context.Context) result {
+		s.RLock()
+		if s.closed {
+			s.RUnlock()
+			return result{error: context.Canceled}
 		}
+		current := s.connection
+		s.RUnlock()
+		if current != nil && isActive(current) {
+			return result{}
+		}
+		conn, err := s.openConnection(ctx)
+		if err != nil && ctx.Err() == nil {
+			conn, err = s.openConnection(ctx)
+		}
+		if err != nil {
+			return result{error: err}
+		}
+		if ctx.Err() != nil {
+			conn.CloseWithError(0, "")
+			return result{error: ctx.Err()}
+		}
+		s.connectionFlights.flightsMu.Lock()
+		if s.connectionFlights.flights["connection"] != ctx.Value(flightKey{}) || ctx.Err() != nil {
+			s.connectionFlights.flightsMu.Unlock()
+			conn.CloseWithError(0, "")
+			return result{error: context.Canceled}
+		}
+		err = s.publishConnection(conn)
+		s.connectionFlights.flightsMu.Unlock()
+		return result{error: err}
+	})
+	if ret.error != nil {
+		return nil, ret.error
 	}
-	s.connection = conn
+	s.RLock()
+	conn = s.connection
+	closed := s.closed
+	s.RUnlock()
+	if closed {
+		return nil, context.Canceled
+	}
 	return conn, nil
 }
 
-func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
+func (s *QUICNameServer) publishConnection(conn *quic.Conn) error {
+	s.Lock()
+	if s.closed {
+		s.Unlock()
+		conn.CloseWithError(0, "DNS shutdown")
+		return context.Canceled
+	}
+	s.connection = conn
+	s.Unlock()
+	return nil
+}
+
+// Publication and shutdown use the same lock; a completed handshake cannot
+// install a connection after shutdown has closed the previous generation.
+func (s *QUICNameServer) close() {
+	s.Lock()
+	s.closed = true
+	conn := s.connection
+	s.connection = nil
+	s.Unlock()
+	if conn != nil {
+		conn.CloseWithError(0, "DNS shutdown")
+	}
+}
+
+func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error) {
 	tlsConfig := tls.Config{}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeTimeout,
 	}
 	tlsConfig.ServerName = s.destination.Address.String()
-	conn, err := quic.DialAddr(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	conn, err := quic.DialAddr(ctx, s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -278,7 +348,7 @@ func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
 }
 
 func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
-	conn, err := s.getConnection()
+	conn, err := s.getConnection(ctx)
 	if err != nil {
 		return nil, err
 	}

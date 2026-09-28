@@ -179,7 +179,17 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption
 		return nil, 0, dns.ErrEmptyResponse
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, c.timeoutMs)
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+	scope := scopeFromContext(ctx)
+	timeout := c.timeoutMs
+	if timeout <= 0 {
+		timeout = 4 * time.Second
+	}
+	scope.timeout = timeout
+	ctx = context.WithValue(ctx, queryScopeKey{}, scope)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
 	ips, ttl, err := c.server.QueryIP(ctx, domain, option)
 	cancel()

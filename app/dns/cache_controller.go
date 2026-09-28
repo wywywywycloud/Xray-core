@@ -14,7 +14,6 @@ import (
 	dns_feature "github.com/xtls/xray-core/features/dns"
 
 	"golang.org/x/net/dns/dnsmessage"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -37,7 +36,8 @@ type CacheController struct {
 	pub           *pubsub.Service
 	cacheCleanup  *task.Periodic
 	highWatermark int
-	requestGroup  singleflight.Group
+	flightsMu     sync.Mutex
+	flights       map[string]*queryFlight
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -243,6 +243,16 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
+	// Delivery is scoped to the producing generation. Canceled/late responses
+	// neither wake a later same-name flight nor populate the cache.
+	if req.flight != nil {
+		req.flight.deliveryMu.Lock()
+		defer req.flight.deliveryMu.Unlock()
+		if req.flight.ctx.Err() != nil {
+			return
+		}
+		req.flight.answers <- flightAnswer{family: req.reqType, record: rep}
+	}
 	rtt := time.Since(req.start)
 
 	switch req.reqType {

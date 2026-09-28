@@ -62,6 +62,7 @@ func (r *IPRecord) getIPs() ([]net.IP, int32, error) {
 var errRecordNotFound = errors.New("record not found")
 
 type dnsRequest struct {
+	flight  *queryFlight
 	reqType dnsmessage.Type
 	domain  string
 	start   time.Time
@@ -254,6 +255,11 @@ L:
 	}
 
 	return ipRecord, nil
+}
+
+// queryDnsContext retains query cancellation for dedicated transports.
+func queryDnsContext(ctx context.Context, addr string) context.Context {
+	return serviceValues{Context: ctx, service: toDnsContext(ctx, addr)}
 }
 
 // toDnsContext create a new background context with parent inbound, session and dns log

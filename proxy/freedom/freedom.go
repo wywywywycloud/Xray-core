@@ -285,14 +285,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var blockedDest *net.Destination
 	var blockedRule *FinalRule
 	firstResolve := true
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+	err := retry.OnContext(ctx, retry.ExponentialBackoff(5, 100), func() error {
 		dialDest := destination
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
 			strategy := h.config.DomainStrategy
 			if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
 				strategy = strategy.GetDynamicStrategy(origTargetAddr.Family())
 			}
-			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
+			ips, err := internet.LookupForIPContext(ctx, dialDest.Address.Domain(), strategy, outGateway)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err != nil {
 				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
 				if h.config.DomainStrategy.ForceIP() || h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) {
@@ -315,6 +318,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				if supportIPv4 {
 					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip4", domain)
 				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if len(ips) == 0 && supportIPv6 {
 					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip6", domain)
 				}
@@ -332,12 +338,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				errors.LogInfo(ctx, "dialing to ", dialDest)
 			}
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if rule := h.matchFinalRule(dialDest.Network, dialDest.Address, dialDest.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
 			blockedDest = &dialDest
 			blockedRule = rule
 			return nil
 		}
 
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
 			return err
@@ -347,6 +359,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return nil
 	})
 	if err != nil {
+		// Cancellation can win after Dial has returned a live connection.
+		if conn != nil {
+			conn.Close()
+		}
 		return errors.New("failed to open connection to ", destination).Base(err)
 	}
 	if blockedDest != nil {
@@ -408,7 +424,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				writer = buf.NewWriter(conn)
 			}
 		} else {
-			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination)
+			writer = newPacketWriterContext(ctx, conn, h, defaultRule, UDPOverride, destination)
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -538,6 +554,9 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 // DialDest means the dial target used in the dialer when creating conn
 func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination) buf.Writer {
+	return newPacketWriterContext(context.Background(), conn, h, defaultRule, UDPOverride, DialDest)
+}
+func newPacketWriterContext(ctx context.Context, conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination) buf.Writer {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -555,6 +574,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 			resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
 		}
 		return &PacketWriter{
+			ctx:               ctx,
 			PacketConnWrapper: c,
 			Counter:           counter,
 			Handler:           h,
@@ -569,6 +589,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 }
 
 type PacketWriter struct {
+	ctx context.Context
 	*internet.PacketConnWrapper
 	stats.Counter
 	*Handler
@@ -584,7 +605,15 @@ type PacketWriter struct {
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
+		if ctx.Err() != nil {
+			buf.ReleaseMulti(mb)
+			return ctx.Err()
+		}
 		mb2, b := buf.SplitFirst(mb)
 		mb = mb2
 		if b == nil {
@@ -605,7 +634,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				} else {
 					ShouldUseSystemResolver := true
 					if w.Handler.config.DomainStrategy.HasStrategy() {
-						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), w.Handler.config.DomainStrategy, w.LocalAddr)
+						ips, err := internet.LookupForIPContext(ctx, b.UDP.Address.Domain(), w.Handler.config.DomainStrategy, w.LocalAddr)
 						if err != nil {
 							// drop packet if resolve failed when forceIP
 							if w.Handler.config.DomainStrategy.ForceIP() {
@@ -618,12 +647,14 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 						}
 					}
 					if ShouldUseSystemResolver {
-						udpAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
+						ips, err := net.DefaultResolver.LookupIP(ctx, "ip", b.UDP.Address.Domain())
 						if err != nil {
 							b.Release()
 							continue
 						} else {
-							ip = net.IPAddress(udpAddr.IP)
+							if selected := udpDomainIP(ips); selected != nil {
+								ip = net.IPAddress(selected)
+							}
 						}
 					}
 					if ip != nil {
@@ -654,6 +685,20 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 	}
 	return nil
+}
+
+func udpDomainIP(ips []net.IP) net.IP {
+	// Match ResolveUDPAddr("udp", domain:port): prefer the first IPv4
+	// address, falling back to the first address when none is IPv4.
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip
+		}
+	}
+	if len(ips) == 0 {
+		return nil
+	}
+	return ips[0]
 }
 
 type NoisePacketWriter struct {

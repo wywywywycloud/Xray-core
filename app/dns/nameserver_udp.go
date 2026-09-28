@@ -25,6 +25,7 @@ type ClassicNameServer struct {
 	cacheController *CacheController
 	address         *net.Destination
 	requests        map[uint16]*udpDnsRequest
+	retired         map[uint16]time.Time
 	udpServer       *udp.Dispatcher
 	requestsCleanup *task.Periodic
 	reqID           uint32
@@ -47,6 +48,7 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address,
 		requests:        make(map[uint16]*udpDnsRequest),
+		retired:         make(map[uint16]time.Time),
 		clientIP:        clientIP,
 	}
 	s.requestsCleanup = &task.Periodic{
@@ -75,7 +77,12 @@ func (s *ClassicNameServer) RequestsCleanup() error {
 	s.Lock()
 	defer s.Unlock()
 
-	if len(s.requests) == 0 {
+	for id, until := range s.retired {
+		if !now.Before(until) {
+			delete(s.retired, id)
+		}
+	}
+	if len(s.requests) == 0 && len(s.retired) == 0 {
 		return errors.New(s.Name(), " nothing to do. stopping...")
 	}
 
@@ -107,10 +114,11 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 	req, ok := s.requests[id]
 	if ok {
 		// remove the pending request
+		s.retired[id] = req.expire
 		delete(s.requests, id)
 	}
 	s.Unlock()
-	if !ok {
+	if !ok || req.ctx.Err() != nil {
 		errors.LogErrorInner(ctx, err, s.Name(), " cannot find the pending request")
 		return
 	}
@@ -129,8 +137,15 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 			newMsg.Additionals = append(newMsg.Additionals, *opt)
 			newMsg.ID = s.newReqID()
 			newReq.msg = &newMsg
-			s.addPendingRequest(&newReq)
+			if !s.addPendingRequest(&newReq) {
+				return
+			}
 			b, _ := dns.PackMessage(newReq.msg)
+			if newReq.ctx.Err() != nil {
+				b.Release()
+				s.cancelRequests(newReq.ctx)
+				return
+			}
 			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
 			return
 		}
@@ -140,16 +155,47 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 }
 
 func (s *ClassicNameServer) newReqID() uint16 {
-	return uint16(atomic.AddUint32(&s.reqID, 1))
+	s.Lock()
+	defer s.Unlock()
+	now := time.Now()
+	for range 1 << 16 {
+		id := uint16(atomic.AddUint32(&s.reqID, 1))
+		if s.requests[id] == nil && !now.Before(s.retired[id]) {
+			delete(s.retired, id)
+			return id
+		}
+	}
+	// addPendingRequest rejects an occupied/quarantined ID rather than replacing it.
+	return uint16(s.reqID)
 }
 
-func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) {
+func (s *ClassicNameServer) cancelRequests(ctx context.Context) {
 	s.Lock()
+	defer s.Unlock()
+	for id, req := range s.requests {
+		if req.ctx == ctx {
+			s.retired[id] = req.expire
+			delete(s.requests, id)
+		}
+	}
+}
+
+func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
+	s.Lock()
+	if req.ctx.Err() != nil {
+		s.Unlock()
+		return false
+	}
 	id := req.msg.ID
+	if s.requests[id] != nil || time.Now().Before(s.retired[id]) {
+		s.Unlock()
+		return false
+	}
 	req.expire = time.Now().Add(time.Second * 8)
 	s.requests[id] = req
 	s.Unlock()
 	common.Must(s.requestsCleanup.Start())
+	return true
 }
 
 // getCacheController implements CachedNameserver.
@@ -176,17 +222,28 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 	}
 
 	for _, req := range reqs {
+		req.flight, _ = ctx.Value(flightKey{}).(*queryFlight)
 		udpReq := &udpDnsRequest{
 			dnsRequest: *req,
 			ctx:        ctx,
 		}
-		s.addPendingRequest(udpReq)
+		if !s.addPendingRequest(udpReq) {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- errors.New("DNS query canceled or transaction IDs exhausted")
+			}
+			return
+		}
 		b, err := dns.PackMessage(req.msg)
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to pack dns query")
 			if noResponseErrCh != nil {
 				noResponseErrCh <- err
 			}
+			return
+		}
+		if ctx.Err() != nil {
+			b.Release()
+			s.cancelRequests(ctx)
 			return
 		}
 		s.udpServer.Dispatch(toDnsContext(ctx, s.address.String()), *s.address, b)

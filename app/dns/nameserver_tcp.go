@@ -41,7 +41,7 @@ func NewTCPNameServer(
 	}
 
 	s.dial = func(ctx context.Context) (net.Conn, error) {
-		link, err := dispatcher.Dispatch(toDnsContext(ctx, s.destination.String()), *s.destination)
+		link, err := dispatcher.Dispatch(queryDnsContext(ctx, s.destination.String()), *s.destination)
 		if err != nil {
 			return nil, err
 		}
@@ -135,7 +135,20 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
+		req.flight, _ = ctx.Value(flightKey{}).(*queryFlight)
+		if ctx.Err() != nil {
+			return
+		}
+		if req.flight != nil {
+			req.flight.workers.Add(1)
+		}
 		go func(r *dnsRequest) {
+			if r.flight != nil {
+				defer r.flight.workers.Done()
+			}
+			if ctx.Err() != nil {
+				return
+			}
 			dnsCtx := ctx
 
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -169,6 +182,8 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				return
 			}
 			defer conn.Close()
+			stopClose := context.AfterFunc(dnsCtx, func() { conn.Close() })
+			defer stopClose()
 			dnsReqBuf := buf.New()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
