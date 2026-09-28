@@ -124,3 +124,18 @@ func BenchmarkPacketUpSplit(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkPacketUpClosedWriter(b *testing.B) {
+	_, writer := pipe.New(pipe.WithSizeLimit(32767))
+	w := uploadWriter{writer, 32768}
+	w.Close()
+	data := make([]byte, 1<<20)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if n, err := w.Write(data); n != 0 || err != io.ErrClosedPipe {
+			b.Fatalf("closed write: %d %v", n, err)
+		}
+	}
+}

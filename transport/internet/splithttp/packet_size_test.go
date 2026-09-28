@@ -143,14 +143,19 @@ func TestPacketUpPostSizes(t *testing.T) {
 }
 
 func TestPacketUpCloseAndPeerFailure(t *testing.T) {
-	for _, peerFailure := range []bool{false, true} {
-		t.Run(fmt.Sprintf("peerFailure=%v", peerFailure), func(t *testing.T) {
-			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	for _, failure := range []string{"cancel-close", "reject", "disconnect"} {
+		t.Run(failure, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					w.WriteHeader(http.StatusOK)
 					w.Write([]byte{1})
 					w.(http.Flusher).Flush()
 					<-r.Context().Done()
+					return
+				}
+				if failure == "disconnect" {
+					server.CloseClientConnections()
 					return
 				}
 				io.Copy(io.Discard, r.Body)
@@ -178,7 +183,7 @@ func TestPacketUpCloseAndPeerFailure(t *testing.T) {
 			if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
 				t.Fatal(err)
 			}
-			if !peerFailure {
+			if failure == "cancel-close" {
 				// The caller closes the connection on cancellation; HTTP requests
 				// deliberately use context.WithoutCancel in the existing transport.
 				cancel()

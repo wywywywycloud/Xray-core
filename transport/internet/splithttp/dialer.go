@@ -488,10 +488,16 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	maxUploadSize := scMaxEachPostBytes.To
+	randomizePostSize := scMaxEachPostBytes.From != scMaxEachPostBytes.To
+	uploadBufferLimit := max(0, maxUploadSize-buf.Size)
 	// The pipe accepts one buffer while at or below its limit. Leave room
 	// for a full POST even when its limit falls between buffer boundaries;
-	// queued bytes remain below maxUploadSize + buf.Size.
-	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - 1))
+	// queued bytes remain below maxUploadSize + buf.Size. Fixed limits keep
+	// their existing buffering and splitting behavior.
+	if randomizePostSize {
+		uploadBufferLimit = maxUploadSize - 1
+	}
+	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(uploadBufferLimit))
 
 	conn.writer = uploadWriter{
 		uploadPipeWriter,
@@ -516,8 +522,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			doSplit := atomic.Bool{}
 			for doSplit.Store(true); doSplit.Load(); {
 				var chunk buf.MultiBuffer
-				postSize := scMaxEachPostBytes.rand()
-				remainder, chunk = splitPacketUp(remainder, postSize)
+				if randomizePostSize {
+					remainder, chunk = splitPacketUp(remainder, scMaxEachPostBytes.rand())
+				} else {
+					remainder, chunk = buf.SplitSize(remainder, maxUploadSize)
+				}
 				if chunk.IsEmpty() {
 					break
 				}
