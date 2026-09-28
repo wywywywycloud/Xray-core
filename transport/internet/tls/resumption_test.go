@@ -551,6 +551,43 @@ func TestResumptionHandshakeCancellation(t *testing.T) {
 	}
 }
 
+func TestResumptionXrayServerConfig(t *testing.T) {
+	for _, version := range []uint16{gotls.VersionTLS12, gotls.VersionTLS13} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/enabled=%v", gotls.VersionName(version), enabled), func(t *testing.T) {
+				fixture, client := resumptionFixture(t, version)
+				key, err := x509.MarshalPKCS8PrivateKey(fixture.Certificates[0].PrivateKey)
+				if err != nil {
+					t.Fatal(err)
+				}
+				v := "1.2"
+				if version == gotls.VersionTLS13 {
+					v = "1.3"
+				}
+				source := &Config{EnableSessionResumption: enabled, MinVersion: v, MaxVersion: v, Certificate: []*Certificate{{
+					Certificate: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: fixture.Certificates[0].Certificate[0]}),
+					Key:         pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), Usage: Certificate_ENCIPHERMENT, OneTimeLoading: true,
+				}}}
+				server := source.GetTLSConfig()
+				if server.VerifyConnection != nil {
+					t.Fatal("client verifier installed on server")
+				}
+				if server.SessionTicketsDisabled == enabled {
+					t.Fatal("server ticket setting changed")
+				}
+				addr := resumptionServer(t, server)
+				for i := 0; i < 3; i++ {
+					r, err := resumptionDial(t, addr, client.GetTLSConfig(), "go", nil)
+					if err != nil || r != (enabled && i > 0) {
+						t.Fatalf("server handshake %d resumed=%v err=%v", i, r, err)
+					}
+				}
+			})
+		}
+	}
+
+}
+
 func TestResumptionWorkload(t *testing.T) {
 	if os.Getenv("TLS_RESUMPTION_WORKLOAD") == "" {
 		t.Skip("explicit workload only")
