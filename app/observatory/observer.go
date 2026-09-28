@@ -14,8 +14,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	v2net "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal/done"
-	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
@@ -32,7 +30,9 @@ type Observer struct {
 	statusLock sync.Mutex
 	status     []*OutboundStatus
 
-	finished *done.Instance
+	lifecycleLock sync.Mutex
+	cancel        context.CancelFunc
+	finished      chan struct{}
 
 	ohm        outbound.Manager
 	dispatcher routing.Dispatcher
@@ -50,68 +50,94 @@ func (o *Observer) Type() interface{} {
 }
 
 func (o *Observer) Start() error {
-	if o.config != nil && len(o.config.SubjectSelector) != 0 {
-		o.finished = done.New()
-		go o.background()
+	o.lifecycleLock.Lock()
+	defer o.lifecycleLock.Unlock()
+	if o.cancel != nil || o.config == nil || len(o.config.SubjectSelector) == 0 {
+		return nil
 	}
+	ctx, cancel := context.WithCancel(o.ctx)
+	o.cancel = cancel
+	o.finished = make(chan struct{})
+	go func() {
+		defer close(o.finished)
+		o.background(ctx)
+	}()
 	return nil
 }
 
 func (o *Observer) Close() error {
-	if o.finished != nil {
-		return o.finished.Close()
+	o.lifecycleLock.Lock()
+	defer o.lifecycleLock.Unlock()
+	if o.cancel != nil {
+		o.cancel()
+		<-o.finished
+		o.cancel = nil
 	}
 	return nil
 }
 
-func (o *Observer) background() {
-	for !o.finished.Done() {
+func (o *Observer) background(ctx context.Context) {
+	sleepTime := time.Second * 10
+	if o.config.ProbeInterval != 0 {
+		sleepTime = time.Duration(o.config.ProbeInterval)
+	}
+	wait := func() bool {
+		timer := time.NewTimer(sleepTime)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+	for ctx.Err() == nil {
 		hs, ok := o.ohm.(outbound.HandlerSelector)
 		if !ok {
-			errors.LogInfo(o.ctx, "outbound.Manager is not a HandlerSelector")
+			errors.LogInfo(ctx, "outbound.Manager is not a HandlerSelector")
 			return
 		}
-
 		outbounds := hs.Select(o.config.SubjectSelector)
-
 		o.clearRemovedOutbounds(outbounds)
-
-		sleepTime := time.Second * 10
-		if o.config.ProbeInterval != 0 {
-			sleepTime = time.Duration(o.config.ProbeInterval)
-		}
-
 		if !o.config.EnableConcurrency {
 			sort.Strings(outbounds)
 			for _, v := range outbounds {
-				result := o.probe(v)
-				o.updateStatusForResult(v, &result)
-				if o.finished.Done() {
+				if ctx.Err() != nil {
 					return
 				}
-				time.Sleep(sleepTime)
+				result := o.probe(ctx, v)
+				if ctx.Err() != nil {
+					return
+				}
+				o.updateStatusForResult(v, &result)
+				if !wait() {
+					return
+				}
+			}
+			// An empty selector result must not spin until a handler is added.
+			if len(outbounds) == 0 && !wait() {
+				return
 			}
 			continue
 		}
-
-		ch := make(chan struct{}, len(outbounds))
-
+		var probes sync.WaitGroup
 		for _, v := range outbounds {
+			if ctx.Err() != nil {
+				break
+			}
+			probes.Add(1)
 			go func(v string) {
-				result := o.probe(v)
-				o.updateStatusForResult(v, &result)
-				ch <- struct{}{}
+				defer probes.Done()
+				result := o.probe(ctx, v)
+				if ctx.Err() == nil {
+					o.updateStatusForResult(v, &result)
+				}
 			}(v)
 		}
-
-		for range outbounds {
-			select {
-			case <-ch:
-			case <-o.finished.Wait():
-				return
-			}
+		probes.Wait()
+		if !wait() {
+			return
 		}
-		time.Sleep(sleepTime)
 	}
 }
 
@@ -130,36 +156,29 @@ func (o *Observer) clearRemovedOutbounds(outbounds []string) {
 	o.status = pruned
 }
 
-func (o *Observer) probe(outbound string) ProbeResult {
+func (o *Observer) probe(ctx context.Context, outbound string) ProbeResult {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	errorCollectorForRequest := newErrorCollector()
 
 	httpTransport := http.Transport{
 		Proxy: func(*http.Request) (*url.URL, error) {
 			return nil, nil
 		},
-		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
-			var connection net.Conn
-			taskErr := task.Run(ctx, func() error {
-				// MUST use Xray's built in context system
-				dest, err := v2net.ParseDestination(network + ":" + addr)
-				if err != nil {
-					return errors.New("cannot understand address").Base(err)
-				}
-				trackedCtx := session.TrackedConnectionError(o.ctx, errorCollectorForRequest)
-				conn, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
-				if err != nil {
-					return errors.New("cannot dial remote address ", dest).Base(err)
-				}
-				connection = conn
-				return nil
-			})
-			if taskErr != nil {
-				return nil, errors.New("cannot finish connection").Base(taskErr)
+		DisableKeepAlives: true,
+		DialContext: func(_ context.Context, network string, addr string) (net.Conn, error) {
+			dest, err := v2net.ParseDestination(network + ":" + addr)
+			if err != nil {
+				return nil, errors.New("cannot understand address").Base(err)
 			}
-			return connection, nil
+			// Each probe owns its transport. Preserve its exact context because
+			// net/http detaches cancellation from the context passed to DialContext.
+			trackedCtx := session.TrackedConnectionError(ctx, errorCollectorForRequest)
+			return tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
 		},
 		TLSHandshakeTimeout: time.Second * 5,
 	}
+	defer httpTransport.CloseIdleConnections()
 	httpClient := &http.Client{
 		Transport: &httpTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -169,13 +188,16 @@ func (o *Observer) probe(outbound string) ProbeResult {
 		Timeout: time.Second * 5,
 	}
 	var GETTime time.Duration
-	err := task.Run(o.ctx, func() error {
+	err := func() error {
 		startTime := time.Now()
 		probeURL := "https://www.google.com/generate_204"
 		if o.config.ProbeUrl != "" {
 			probeURL = o.config.ProbeUrl
 		}
-		req, _ := http.NewRequest(http.MethodGet, probeURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+		if err != nil {
+			return err
+		}
 		utils.TryDefaultHeadersWith(req.Header, "nav")
 		response, err := httpClient.Do(req)
 		if err != nil {
@@ -187,7 +209,7 @@ func (o *Observer) probe(outbound string) ProbeResult {
 		endTime := time.Now()
 		GETTime = endTime.Sub(startTime)
 		return nil
-	})
+	}()
 	if err != nil {
 		errorMessage := "the outbound " + outbound + " is dead: GET request failed:" + err.Error() + "with outbound handler report underlying connection failed"
 		errors.LogInfoInner(o.ctx, errorCollectorForRequest.UnderlyingError(), errorMessage)
