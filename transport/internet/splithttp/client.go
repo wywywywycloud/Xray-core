@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 
 	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common"
@@ -32,7 +33,7 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	closed          bool
+	closed          atomic.Bool
 	httpVersion     string
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
@@ -40,7 +41,7 @@ type DefaultDialerClient struct {
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed
+	return c.closed.Load()
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -72,7 +73,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed = true
+				c.closed.Store(true)
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
@@ -108,7 +109,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed = true
+			c.closed.Store(true)
 			return err
 		}
 
@@ -148,7 +149,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed = true
+						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
@@ -187,38 +188,53 @@ func (c *DefaultDialerClient) Close() error {
 }
 
 type WaitReadCloser struct {
-	Wait chan struct{}
-	io.ReadCloser
+	Wait   chan struct{}
+	mu     sync.Mutex
+	reader io.ReadCloser
+	ready  bool
+	closed bool
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
-	w.ReadCloser = rc
-	defer func() {
-		if recover() != nil {
-			rc.Close()
-		}
-	}()
+	w.mu.Lock()
+	if w.closed || w.ready {
+		w.mu.Unlock()
+		rc.Close()
+		return
+	}
+	w.reader = rc
+	w.ready = true
 	close(w.Wait)
+	w.mu.Unlock()
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
-			return 0, io.ErrClosedPipe
-		}
+	<-w.Wait
+	w.mu.Lock()
+	rc, closed := w.reader, w.closed
+	w.mu.Unlock()
+	if closed || rc == nil {
+		return 0, io.ErrClosedPipe
 	}
-	return w.ReadCloser.Read(b)
+	return rc.Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
 	}
-	defer func() {
-		if recover() != nil && w.ReadCloser != nil {
-			w.ReadCloser.Close()
-		}
-	}()
-	close(w.Wait)
+	w.closed = true
+	rc := w.reader
+	if !w.ready {
+		w.ready = true
+		close(w.Wait)
+	}
+	w.mu.Unlock()
+	// Closing a live response must be able to interrupt a blocked Read.
+	if rc != nil {
+		return rc.Close()
+	}
 	return nil
 }
