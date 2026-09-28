@@ -1,4 +1,4 @@
-package splithttp_test
+package splithttp
 
 import (
 	"bytes"
@@ -19,7 +19,6 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
-	. "github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -58,6 +57,7 @@ func TestPacketUpPostSizes(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					w.WriteHeader(http.StatusOK)
+					w.Write([]byte{1})
 					w.(http.Flusher).Flush()
 					<-r.Context().Done()
 					return
@@ -86,6 +86,11 @@ func TestPacketUpPostSizes(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer conn.Close()
+			// Isolate upload tests from WaitReadCloser's existing setup race.
+			<-conn.(*splitConn).reader.(*WaitReadCloser).Wait
+			if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
 			seq := 0
 			for batch, size := range []int{2048, 2048, 17, 1025} {
 				cap := 64
@@ -143,6 +148,7 @@ func TestPacketUpCloseAndPeerFailure(t *testing.T) {
 			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					w.WriteHeader(http.StatusOK)
+					w.Write([]byte{1})
 					w.(http.Flusher).Flush()
 					<-r.Context().Done()
 					return
@@ -168,6 +174,10 @@ func TestPacketUpCloseAndPeerFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer conn.Close()
+			<-conn.(*splitConn).reader.(*WaitReadCloser).Wait
+			if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
 			if !peerFailure {
 				// The caller closes the connection on cancellation; HTTP requests
 				// deliberately use context.WithoutCancel in the existing transport.

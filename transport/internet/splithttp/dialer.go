@@ -488,11 +488,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	maxUploadSize := scMaxEachPostBytes.To
-	// WithSizeLimit(0) will still allow single bytes to pass, and a lot of
-	// code relies on this behavior. Subtract 1 so that together with
-	// uploadWriter wrapper, exact size limits can be enforced
-	// uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - 1))
-	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(max(0, maxUploadSize-buf.Size)))
+	// The pipe accepts one buffer while at or below its limit. Leave room
+	// for a full POST even when its limit falls between buffer boundaries;
+	// queued bytes remain below maxUploadSize + buf.Size.
+	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(maxUploadSize - 1))
 
 	conn.writer = uploadWriter{
 		uploadPipeWriter,
@@ -518,7 +517,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			for doSplit.Store(true); doSplit.Load(); {
 				var chunk buf.MultiBuffer
 				postSize := scMaxEachPostBytes.rand()
-				remainder, chunk = buf.SplitSize(remainder, postSize)
+				remainder, chunk = splitPacketUp(remainder, postSize)
 				if chunk.IsEmpty() {
 					break
 				}
@@ -565,10 +564,23 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 					<-wroteRequest.Wait()
 				}
 			}
+			buf.ReleaseMulti(remainder)
 		}
 	}()
 
 	return stat.Connection(&conn), nil
+}
+
+// SplitSize keeps whole buffers when possible. Split the next buffer once
+// more so a full POST reaches its sampled size instead of an 8 KiB multiple.
+func splitPacketUp(mb buf.MultiBuffer, size int32) (buf.MultiBuffer, buf.MultiBuffer) {
+	remainder, chunk := buf.SplitSize(mb, size)
+	if left := size - chunk.Len(); left > 0 && !remainder.IsEmpty() {
+		var tail buf.MultiBuffer
+		remainder, tail = buf.SplitSize(remainder, left)
+		chunk = append(chunk, tail...)
+	}
+	return remainder, chunk
 }
 
 // A wrapper around pipe that ensures the size limit is exactly honored.
@@ -595,12 +607,14 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 	common.Must2(buffer.Write(b))
 
 	var writed int
-	for _, buff := range buffer.MultiBuffer {
+	for i, buff := range buffer.MultiBuffer {
+		length := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
+			buf.ReleaseMulti(buffer.MultiBuffer[i+1:])
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += length
 	}
 	return writed, nil
 }
