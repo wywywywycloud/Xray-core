@@ -18,6 +18,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
+	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -98,6 +99,19 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 		return "3"
 	}
 	return "2"
+}
+
+func useChrome133SettingsGREASE(tlsConfig *tls.Config, realityConfig *reality.Config) bool {
+	var name string
+	if realityConfig != nil {
+		name = realityConfig.Fingerprint
+	} else if tlsConfig != nil {
+		name = tlsConfig.Fingerprint
+	} else {
+		return false
+	}
+	fingerprint := tls.GetFingerprint(name)
+	return fingerprint != nil && fingerprint.Client == utls.HelloChrome_133.Client && fingerprint.Version == utls.HelloChrome_133.Version
 }
 
 func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig) DialerClient {
@@ -282,6 +296,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			keepAlivePeriod = 0
 		}
 		transport = &http2.Transport{
+			EnableInitialSettingsGREASE: useChrome133SettingsGREASE(tlsConfig, realityConfig),
 			DialTLSContext: func(ctxInner context.Context, network string, addr string, cfg *gotls.Config) (net.Conn, error) {
 				return dialContext(ctxInner)
 			},
