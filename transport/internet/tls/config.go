@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 var globalSessionCache = tls.NewLRUClientSessionCache(128)
@@ -45,10 +47,21 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 	return root, nil
 }
 
-// BuildCertificates builds a list of TLS certificates from proto definition.
+// BuildCertificates returns immutable certificate snapshots from the configuration.
 func (c *Config) BuildCertificates() []*tls.Certificate {
-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
-	for _, entry := range c.Certificate {
+	stores := c.buildCertificateStores()
+	certs := make([]*tls.Certificate, 0, len(stores))
+	for _, store := range stores {
+		certs = append(certs, store.Load())
+	}
+	return certs
+}
+
+func (c *Config) buildCertificateStores() []*atomic.Pointer[tls.Certificate] {
+	stores := make([]*atomic.Pointer[tls.Certificate], 0, len(c.Certificate))
+	for _, configured := range c.Certificate {
+		// Each reload worker owns its PEM state; configs may be reused by listeners.
+		entry := proto.Clone(configured).(*Certificate)
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
 		}
@@ -65,14 +78,15 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 			}
 			return &keyPair
 		}
+		store := &atomic.Pointer[tls.Certificate]{}
 		if keyPair := getX509KeyPair(); keyPair != nil {
-			certs = append(certs, keyPair)
+			store.Store(keyPair)
+			stores = append(stores, store)
 		} else {
 			continue
 		}
-		index := len(certs) - 1
 		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+			cert := store.Load()
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
@@ -84,20 +98,22 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
 				} else if string(newOCSPData) != string(cert.OCSPStaple) {
-					cert.OCSPStaple = newOCSPData
+					next := *cert
+					next.OCSPStaple = newOCSPData
+					cert = &next
 				}
 			}
-			certs[index] = cert
+			store.Store(cert)
 		})
 	}
-	return certs
+	return stores
 }
 
 func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+	if entry.OneTimeLoading || (entry.OcspStapling == 0 && (entry.CertificatePath == "" || entry.KeyPath == "")) {
+		return
+	}
 	go func() {
-		if entry.OneTimeLoading {
-			return
-		}
 		var isOcspstapling bool
 		hotReloadCertInterval := uint64(3600)
 		if entry.OcspStapling != 0 {
@@ -243,20 +259,21 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(certs []*atomic.Pointer[tls.Certificate], rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if len(certs) == 0 {
 			return nil, errNoCertificates
 		}
 		sni := strings.ToLower(hello.ServerName)
 		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
-			return certs[0], nil
+			return certs[0].Load(), nil
 		}
 		gsni := "*"
 		if index := strings.IndexByte(sni, '.'); index != -1 {
 			gsni += sni[index:]
 		}
-		for _, keyPair := range certs {
+		for _, store := range certs {
+			keyPair := store.Load()
 			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
 				return keyPair, nil
 			}
@@ -269,7 +286,7 @@ func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) f
 		if rejectUnknownSNI {
 			return nil, errNoCertificates
 		}
-		return certs[0], nil
+		return certs[0].Load(), nil
 	}
 }
 
@@ -412,7 +429,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(caCerts) > 0 {
 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateStores(), c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {
