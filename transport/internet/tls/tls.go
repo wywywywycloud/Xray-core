@@ -62,6 +62,10 @@ func (c *Conn) NegotiatedProtocol() string {
 
 // Client initiates a TLS client handshake on the given connection.
 func Client(c net.Conn, config *tls.Config) net.Conn {
+	if cache, ok := config.ClientSessionCache.(*scopedSessionCache); ok {
+		config = config.Clone()
+		config.ClientSessionCache = &scopedSessionCache{scope: sessionScope(effectiveSessionScope(cache.scope, config), c.RemoteAddr().String())}
+	}
 	tlsConn := tls.Client(c, config)
 	return &Conn{Conn: tlsConn}
 }
@@ -138,12 +142,46 @@ func (c *UConn) NegotiatedProtocol() string {
 }
 
 func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) net.Conn {
-	utlsConn := utls.UClient(c, copyConfig(config), *fingerprint)
+	utlsConn := newUClient(c, config, *fingerprint)
 	return &UConn{UConn: utlsConn}
 }
 
 func GeneraticUClient(c net.Conn, config *tls.Config) *utls.UConn {
-	return utls.UClient(c, copyConfig(config), utls.HelloChrome_Auto)
+	return newUClient(c, config, utls.HelloChrome_Auto)
+}
+
+func newUClient(c net.Conn, config *tls.Config, fingerprint utls.ClientHelloID) *utls.UConn {
+	cfg := copyConfig(config)
+	if cache, ok := cfg.ClientSessionCache.(*scopedUTLSSessionCache); ok {
+		cfg.ClientSessionCache = &scopedUTLSSessionCache{scope: sessionScope(cache.scope, c.RemoteAddr().String(), fingerprint.Str())}
+	}
+	conn := utls.UClient(c, cfg, fingerprint)
+	// Chrome's regular presets omit PSK. Add the optional resumption extension
+	// before applying the preset; an empty cache must leave no PSK on the wire.
+	// Do not change other browsers or replace the selected Chrome template.
+	if !cfg.SessionTicketsDisabled && cfg.ClientSessionCache != nil && fingerprint.Client == utls.HelloChrome_Auto.Client {
+		if spec, err := utls.UTLSIdToSpec(fingerprint); err == nil {
+			hasPSK, hasModes := false, false
+			for _, ext := range spec.Extensions {
+				if _, ok := ext.(utls.PreSharedKeyExtension); ok {
+					hasPSK = true
+				}
+				if _, ok := ext.(*utls.PSKKeyExchangeModesExtension); ok {
+					hasModes = true
+				}
+			}
+			if hasModes && !hasPSK {
+				spec.Extensions = append(spec.Extensions, &utls.UtlsPreSharedKeyExtension{})
+				conn = utls.UClient(c, cfg, utls.HelloCustom)
+				if err := conn.ApplyPreset(&spec); err != nil {
+					// Preserve a working full-handshake fallback for unsupported presets.
+					cfg.ClientSessionCache = nil
+					return utls.UClient(c, cfg, fingerprint)
+				}
+			}
+		}
+	}
+	return conn
 }
 
 func copyConfig(c *tls.Config) *utls.Config {
@@ -156,6 +194,18 @@ func copyConfig(c *tls.Config) *utls.Config {
 		KeyLogWriter:                   c.KeyLogWriter,
 		EncryptedClientHelloConfigList: c.EncryptedClientHelloConfigList,
 		NextProtos:                     c.NextProtos,
+		Time:                           c.Time,
+		SessionTicketsDisabled:         c.SessionTicketsDisabled,
+		OmitEmptyPsk:                   true,
+	}
+	if cache, ok := c.ClientSessionCache.(*scopedSessionCache); ok && cache.allowUTLS && !c.SessionTicketsDisabled {
+		config.ClientSessionCache = &scopedUTLSSessionCache{scope: effectiveSessionScope(cache.scope, c)}
+		config.VerifyConnection = func(s utls.ConnectionState) error {
+			if s.DidResume {
+				return verifyResumedPeer(c, s.PeerCertificates, s.VerifiedChains)
+			}
+			return nil
+		}
 	}
 	return config
 }

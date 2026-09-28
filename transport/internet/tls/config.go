@@ -353,6 +353,7 @@ func (r *RandCarrier) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509
 }
 
 type RandCarrier struct {
+	destination          string
 	Config               *tls.Config
 	RootCAs              *x509.CertPool
 	VerifyPeerCertByName []string
@@ -479,6 +480,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		}
 	}
 
+	configureSessionCache(c, config)
 	return config
 }
 
@@ -491,6 +493,9 @@ type Option func(*tls.Config)
 // set it to dest -> overwrite it with servername(if it's len>0).
 func WithDestination(dest net.Destination) Option {
 	return func(config *tls.Config) {
+		if carrier, ok := config.Rand.(*RandCarrier); ok {
+			carrier.destination = dest.String()
+		}
 		if config.ServerName == "" {
 			config.ServerName = dest.Address.String()
 		}
