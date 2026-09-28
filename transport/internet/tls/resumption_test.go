@@ -465,6 +465,11 @@ func TestResumptionWebsocketHandshake(t *testing.T) {
 	server.NextProtos = []string{"http/1.1"}
 	client.NextProtocol = []string{"http/1.1"}
 	addr := resumptionServer(t, server)
+	// A prior ordinary handshake with the same source config must not populate
+	// the cache for the path that overrides the preset's ALPN.
+	if _, err := resumptionDial(t, addr, client.GetTLSConfig(), "chrome", nil); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
 		raw, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {

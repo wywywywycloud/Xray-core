@@ -101,6 +101,11 @@ func (c *UConn) HandshakeContextServerName(ctx context.Context) string {
 // to build outer ALPN to `http/1.1` or `h2 http/1.1` (if manually specified for camouflage)
 func (c *UConn) WebsocketHandshakeContext(ctx context.Context) error {
 	config := *utils.AccessField[*utls.Config](c, "config")
+	if cache, ok := config.ClientSessionCache.(*scopedUTLSSessionCache); ok {
+		// This path can change the preset's ALPN after building the hello.
+		// Choose its cache namespace before BuildHandshakeState loads a ticket.
+		config.ClientSessionCache = &scopedUTLSSessionCache{scope: sessionScope(cache.scope, "websocket")}
+	}
 	ALPN := slices.Clone(config.NextProtos)
 	// set other kinds of ALPN to http/1.1
 	if !slices.Equal(ALPN, []string{"h2", "http/1.1"}) {
