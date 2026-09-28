@@ -16,6 +16,23 @@ func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBuffer()
 }
 
+// TryReadMultiBuffer takes currently queued buffers without waiting for data.
+// An open, empty pipe returns nil, nil. Close and Interrupt keep their usual
+// EOF/error semantics; taking data wakes a writer blocked by the size limit.
+func (r *Reader) TryReadMultiBuffer() (buf.MultiBuffer, error) {
+	data, err := r.pipe.readMultiBufferInternal()
+	if data != nil || err != nil {
+		r.pipe.writeSignal.Signal()
+		return data, err
+	}
+	select {
+	case err := <-r.pipe.errChan:
+		return nil, err
+	default:
+		return nil, nil
+	}
+}
+
 // ReadMultiBufferTimeout reads content from a pipe within the given duration, or returns buf.ErrTimeout otherwise.
 func (r *Reader) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBufferTimeout(d)

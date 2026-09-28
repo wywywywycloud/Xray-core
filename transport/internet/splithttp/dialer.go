@@ -79,6 +79,9 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
+	// Protect the selection before releasing the manager lock. The caller
+	// transfers this lease to its stream or uploader.
+	xmuxClient.addLease()
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
 }
 
@@ -324,8 +327,16 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			Transport: transport,
 		},
 		httpVersion:    httpVersion,
-		uploadRawPool:  &sync.Pool{},
 		dialUploadConn: dialContext,
+	}
+	if httpVersion == "1.1" {
+		client.dialUploadConn = func(ctx context.Context) (net.Conn, error) {
+			var fingerprint string
+			if tlsConfig != nil {
+				fingerprint = tlsConfig.Fingerprint
+			}
+			return dialH1Upload(ctx, dest, streamSettings, gotlsConfig, fingerprint)
+		}
 	}
 
 	return client
@@ -442,9 +453,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	if xmuxClient != nil {
 		xmuxClient.AddRunning()
+		xmuxClient.doneLease()
 	}
 	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 		xmuxClient2.AddRunning()
+	}
+	if transportConfiguration.DownloadSettings != nil && xmuxClient2 != nil {
+		xmuxClient2.doneLease()
 	}
 	var closed atomic.Int32
 
@@ -519,12 +534,25 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		maxUploadSize,
 	}
 
+	// The writer can be gracefully closed while its accepted bytes still drain.
+	// Keep that drain independent of the logical stream's Running reference.
+	if xmuxClient != nil {
+		xmuxClient.addLease()
+	}
 	go func() {
 		var seq int64
 		var lastWrite time.Time
 
 		dynamicHTTPClient := httpClient
 		dynamicXmuxClient := xmuxClient
+		defer func() {
+			if dynamicXmuxClient != nil {
+				dynamicXmuxClient.doneLease()
+			}
+		}()
+		// Bound H1 outstanding POSTs across client rotations as well as within
+		// each client's socket pool. This is per logical upload stream.
+		uploadSlots := make(chan struct{}, h1MaxConcurrentUploads)
 		for {
 			// by offloading the uploads into a buffered pipe, multiple conn.Write
 			// calls get automatically batched together into larger POST requests.
@@ -538,7 +566,17 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			for doSplit.Store(true); doSplit.Load(); {
 				var chunk buf.MultiBuffer
 				if randomizePostSize {
-					remainder, chunk = splitPacketUp(remainder, scMaxEachPostBytes.rand())
+					if remainder.IsEmpty() {
+						break
+					}
+					postSize := scMaxEachPostBytes.rand()
+					remainder, err = refillPacketUp(uploadPipeReader, remainder, postSize)
+					if err != nil && err != io.EOF {
+						buf.ReleaseMulti(remainder)
+						uploadPipeReader.Interrupt()
+						return
+					}
+					remainder, chunk = splitPacketUp(remainder, postSize)
 				} else {
 					remainder, chunk = buf.SplitSize(remainder, maxUploadSize)
 				}
@@ -565,10 +603,28 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
 					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
+					previous := dynamicXmuxClient
 					dynamicHTTPClient, dynamicXmuxClient = getHTTPClient(ctx, dest, streamSettings)
+					previous.doneLease()
 				}
 
-				go func(hClient DialerClient) {
+				boundedH1 := false
+				if c, ok := dynamicHTTPClient.(*DefaultDialerClient); ok && c.httpVersion == "1.1" {
+					uploadSlots <- struct{}{}
+					boundedH1 = true
+				}
+				if dynamicXmuxClient != nil {
+					dynamicXmuxClient.addLease()
+				}
+				go func(hClient DialerClient, lease *XmuxClient) {
+					defer func() {
+						if lease != nil {
+							lease.doneLease()
+						}
+						if boundedH1 {
+							<-uploadSlots
+						}
+					}()
 					err := hClient.PostPacket(
 						ctx,
 						requestURL.String(),
@@ -582,7 +638,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 						uploadPipeReader.Interrupt()
 						doSplit.Store(false)
 					}
-				}(dynamicHTTPClient)
+				}(dynamicHTTPClient, dynamicXmuxClient)
 
 				if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 					<-wroteRequest.Wait()
@@ -593,6 +649,20 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}()
 
 	return stat.Connection(&conn), nil
+}
+
+// Keep a batch's tail when the next batch is already available. Never wait for
+// another Write to fill a POST. Before each read, pending bytes are below size;
+// adding one bounded pipe batch keeps pending payload below 2*To + buf.Size.
+func refillPacketUp(reader *pipe.Reader, pending buf.MultiBuffer, size int32) (buf.MultiBuffer, error) {
+	for pending.Len() < size {
+		more, err := reader.TryReadMultiBuffer()
+		if err != nil || more.IsEmpty() {
+			return pending, err
+		}
+		pending, _ = buf.MergeMulti(pending, more)
+	}
+	return pending, nil
 }
 
 // SplitSize keeps whole buffers when possible. Split the next buffer once

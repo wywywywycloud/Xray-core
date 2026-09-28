@@ -23,6 +23,16 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
+	leases       atomic.Int32
+}
+
+// Leases keep selected clients and asynchronous uploads alive without changing
+// Running, which is used to limit logical stream concurrency.
+func (c *XmuxClient) addLease() { c.leases.Add(1) }
+
+func (c *XmuxClient) doneLease() {
+	c.leases.Add(-1)
+	c.maybeClose()
 }
 
 func (c *XmuxClient) AddRunning() {
@@ -36,7 +46,7 @@ func (c *XmuxClient) DoneRunning() {
 
 // close the XmuxConn if it is not used and has no running requests
 func (c *XmuxClient) maybeClose() {
-	if c.NotUsed.Load() && c.Running.Load() <= 0 {
+	if c.NotUsed.Load() && c.Running.Load() <= 0 && c.leases.Load() == 0 {
 		common.Close(c.XmuxConn)
 	}
 }
